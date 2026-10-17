@@ -1,0 +1,28 @@
+{
+  "hero.title": {
+    "text": "Visual Editor Demo",
+    "font_size": 44,
+    "color": "#ffffff",
+    "background_color": "#00000000",
+    "border_radius": 0,
+    "padding": 0,
+    "visible": true
+  },
+  "hero.subtitle": {
+    "text": "Click me in Edit Mode and change my text or style.",
+    "font_size": 18,
+    "color": "#b9c9e8",
+    "background_color": "#00000000",
+    "border_radius": 0,
+    "padding": 0,
+    "visible": true
+  },
+  "demo.card": {
+    "font_size": 16,
+    "color": "#ffffff",
+    "background_color": "#182646",
+    "border_radius": 22,
+    "padding": 24,
+    "visible": true
+  }
+}

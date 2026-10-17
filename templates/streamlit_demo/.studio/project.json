@@ -1,0 +1,7 @@
+{
+  "name": "Project Studio Demo",
+  "project_type": "streamlit",
+  "entry_point": "app.py",
+  "preview_port": 8501,
+  "python_executable": ""
+}

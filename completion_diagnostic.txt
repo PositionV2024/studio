@@ -1,0 +1,16 @@
+HoYo Project Studio - Python completion diagnostic
+Checked: 2026-10-17T11:07:56+00:00
+Application folder: C:\Users\clare\Desktop\hoyo_project_studio
+Application Python: C:\Users\clare\Desktop\hoyo_project_studio\.venv\Scripts\python.exe
+
+python_version: 3.14.0
+jedi: 0.20.1
+parso: 0.8.7
+pygments: 2.21.0
+PASS - Python builtin: pri -> print
+PASS - Python module: math. -> sqrt
+
+PASS - Python completion helper is ready.
+
+This check uses temporary example code and does not open or execute your project files.
+It checks the application's helper; packages specific to a managed project depend on that project's Python environment.
