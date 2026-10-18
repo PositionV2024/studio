@@ -18,3 +18,7 @@ dist/
 launcher_error.log
 *.pyc
 __pycache__/
+
+# Staged startup state
+.hoyo_install.lock
+.hoyo-setup-constraints-*

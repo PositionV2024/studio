@@ -77,6 +77,10 @@ class ProjectRunner(QObject):
         return self.is_running and self._operation != "install"
 
     @property
+    def is_stopping(self) -> bool:
+        return self.is_running and self._intentional_stop
+
+    @property
     def running_project_path(self) -> Path | None:
         if not self.is_preview_running:
             return None
@@ -191,12 +195,14 @@ class ProjectRunner(QObject):
     ) -> None:
         validation_errors = manifest.validate(project_path)
         if validation_errors:
+            self.state_changed.emit("stopped")
             self.failed.emit("\n".join(validation_errors))
             return
 
         try:
             python_executable = self._discover_python(project_path, manifest)
         except RuntimeError as error:
+            self.state_changed.emit("stopped")
             self.failed.emit(str(error))
             return
 
@@ -439,6 +445,7 @@ class ProjectRunner(QObject):
             self._active_manifest is None
             or self._active_project_path is None
             or not self.is_preview_running
+            or self.is_stopping
             or str(self._active_project_path) != project_path
             or self._active_manifest.preview_port != port
         ):
@@ -459,10 +466,10 @@ class ProjectRunner(QObject):
         if html_ready:
             self._health_timer.stop()
             self._preview_url = f"http://127.0.0.1:{port}"
-            self.preview_ready.emit(project_path, self._preview_url)
             self.log_received.emit(
-                f"\nPreview ready: {self._preview_url}\n"
+                f"\nStreamlit server ready: {self._preview_url}\n"
             )
+            self.preview_ready.emit(project_path, self._preview_url)
             return
 
         if self._health_attempts >= self._max_health_attempts:
@@ -483,6 +490,11 @@ class ProjectRunner(QObject):
 
     def _on_started(self) -> None:
         if self._active_manifest is None or self._active_project_path is None:
+            return
+        if self._intentional_stop:
+            # Stop can be pressed while QProcess is still starting. Do not
+            # announce a new preview or reopen its tab during that shutdown.
+            self.process.terminate()
             return
 
         pid = self.process_id
@@ -560,23 +572,31 @@ class ProjectRunner(QObject):
         self._health_timer.stop()
         self._cancel_preview_probe()
 
+        intentional = self._intentional_stop
+        if error == QProcess.ProcessError.FailedToStart:
+            # QProcess does not emit finished() for a launch failure. This
+            # terminal cleanup must also run if Stop/Switch was pressed while
+            # the failed process was still in Starting state.
+            self._kill_timer.stop()
+            self._operation = "idle"
+            self._intentional_stop = False
+            self._stop_reason = ""
+            self._preview_url = None
+            self._active_project_path = None
+            self._active_manifest = None
+            self.state_changed.emit("stopped")
+            if self._pending_start is not None:
+                QTimer.singleShot(80, self._start_pending_project)
+
         # QProcess can report Crashed, Timedout, or WriteError while an
         # intentionally terminated Windows process is closing. None of those
         # should be presented as an application crash.
-        if self._intentional_stop:
+        if intentional:
             self.log_received.emit("Process closed by Project Studio.\n")
             return
 
         message = self.process.errorString() or "Unknown process error"
         self.log_received.emit(f"\nERROR: {message}\n")
         self._error_reported = True
-
-        if error == QProcess.ProcessError.FailedToStart:
-            self._kill_timer.stop()
-            self._operation = "idle"
-            self._preview_url = None
-            self._active_project_path = None
-            self._active_manifest = None
-            self.state_changed.emit("stopped")
 
         self.failed.emit(message)
