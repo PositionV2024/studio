@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QTabWidget, QWidget
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QPushButton, QTabWidget, QWidget
 
 from studio.code_editor import CodeEditorDocument, shutdown_python_assist
 from studio.main_window import MainWindow
@@ -130,8 +130,8 @@ def test_new_file_without_suffix_opens_python_editor_with_completion_and_help(
     document = window.open_editors[path.resolve()]
     assert window.document_tabs.currentWidget() is document
     assert document.editor.is_python
-    assert document.suggest_button.isVisible()
-    assert document.help_button.isVisible()
+    buttons = {button.text() for button in document.findChildren(QPushButton)}
+    assert "Suggest" not in buttons and "Python Help" not in buttons
     assert document.syntax_label.isVisible()
 
     window.activateWindow()
@@ -149,9 +149,10 @@ def test_new_file_without_suffix_opens_python_editor_with_completion_and_help(
     assert path.read_bytes() == b""
 
     QTest.keyClick(document.editor, Qt.Key.Key_F1)
-    _wait_for(file_editor_app, lambda: "print" in document.help_title.text().lower())
-    assert document.help_panel.isVisible()
-    assert "stdout" in document.help_text.toPlainText()
+    popup = document.editor.completer.popup()
+    _wait_for(file_editor_app, lambda: "print" in popup.details_title.text().lower())
+    assert popup.isVisible() and popup.details_only
+    assert "stdout" in popup.details_text.toPlainText()
 
 
 def test_existing_extensionless_file_language_choice_survives_reopening(
@@ -177,8 +178,8 @@ def test_existing_extensionless_file_language_choice_survives_reopening(
     restored = second.open_editors[path.resolve()]
     assert restored.language_mode == "python"
     assert restored.editor.is_python
-    assert restored.help_button.isVisible()
-    assert restored.suggest_button.isVisible()
+    buttons = {button.text() for button in restored.findChildren(QPushButton)}
+    assert "Suggest" not in buttons and "Python Help" not in buttons
     assert path.read_bytes() == original
     assert not path.with_suffix(".py").exists()
     assert not restored.is_modified

@@ -9,7 +9,7 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from studio.code_editor import CodeEditorDocument, shutdown_python_assist
 from studio.python_assist import syntax_check
@@ -78,6 +78,17 @@ def token_color(document, line, column):
 def completion_names(document):
     model = document.editor.completion_model
     return [model.item(index).data(Qt.ItemDataRole.UserRole)["name"] for index in range(model.rowCount())]
+
+
+def completion_popup(document):
+    return document.editor.completer.popup()
+
+
+def assert_compact_toolbar(document):
+    buttons = {button.text() for button in document.findChildren(QPushButton)}
+    assert "Suggest" not in buttons
+    assert "Python Help" not in buttons
+    assert "Save" in buttons and "Reload" in buttons
 
 
 def choose_completion(document, name):
@@ -190,8 +201,9 @@ def test_signatures_and_explicit_help(editor_app, documents):
     assert "Current argument:</b> name" in document.signature_label.text()
     set_cursor(document, 5, 3)
     QTest.keyClick(document.editor, Qt.Key.Key_F1)
-    wait_for(editor_app, lambda: "Welcome a person by name." in document.help_text.toPlainText())
-    assert document.help_panel.isVisible()
+    popup = completion_popup(document)
+    wait_for(editor_app, lambda: "Welcome a person by name." in popup.details_text.toPlainText())
+    assert popup.isVisible() and popup.details_only
 
 
 def test_syntax_errors_underlined_and_compile_scope_errors_detected(editor_app, documents):
@@ -239,20 +251,16 @@ def test_one_worker_and_stale_replies_are_discarded(editor_app, documents, monke
     assert second._document_id not in second._service._active
 
 
-@pytest.mark.parametrize("trigger", ["automatic", "button", "shortcut"])
+@pytest.mark.parametrize("trigger", ["automatic", "shortcut"])
 def test_missing_jedi_still_completes_and_opens_builtin_help(editor_app, documents, monkeypatch, trigger):
     document = documents("answer = 42\n")
     monkeypatch.setattr(document._service, "jedi_available", False)
     document._set_assist_ready()
     assert "Basic Python suggestions" in document.assist_label.text()
-    assert document.suggest_button.isEnabled()
+    assert_compact_toolbar(document)
     document.editor.moveCursor(QTextCursor.MoveOperation.End)
     QTest.keyClicks(document.editor, "pri")
-    if trigger == "button":
-        document._completion_timer.stop()
-        document.suggest_button.setFocus()
-        QTest.mouseClick(document.suggest_button, Qt.MouseButton.LeftButton)
-    elif trigger == "shortcut":
+    if trigger == "shortcut":
         document._completion_timer.stop()
         QTest.keyClick(document.editor, Qt.Key.Key_Space, Qt.KeyboardModifier.ControlModifier)
     wait_for(editor_app, lambda: document.editor.completer.popup().isVisible() and "print" in completion_names(document))
@@ -260,8 +268,9 @@ def test_missing_jedi_still_completes_and_opens_builtin_help(editor_app, documen
     choose_completion(document, "print")
     assert document.editor.toPlainText() == "answer = 42\nprint"
     QTest.keyClick(document.editor, Qt.Key.Key_F1)
-    wait_for(editor_app, lambda: "print(" in document.help_text.toPlainText())
-    assert document.help_panel.isVisible()
+    popup = completion_popup(document)
+    wait_for(editor_app, lambda: "print(" in popup.details_text.toPlainText())
+    assert popup.isVisible() and popup.details_only
     assert "Basic Python suggestions" in document.assist_label.text()
     assert document.save()
     wait_for(editor_app, lambda: "no errors" in document.syntax_label.text())
@@ -288,7 +297,7 @@ def test_slow_project_helper_keeps_immediate_suggestions_and_selection(editor_ap
 
     monkeypatch.setattr(document._service, "_query_jedi", delayed_query)
     try:
-        QTest.mouseClick(document.suggest_button, Qt.MouseButton.LeftButton)
+        QTest.keyClick(document.editor, Qt.Key.Key_Space, Qt.KeyboardModifier.ControlModifier)
         wait_for(editor_app, entered.is_set)
         wait_for(editor_app, lambda: document.editor.completer.popup().isVisible(), timeout=1)
         assert not finished.is_set()
@@ -311,8 +320,7 @@ def test_extensionless_file_can_enable_python_completion_and_help_without_reload
     document = documents(name="dwd", raw=raw)
     assert document.language_mode == "auto"
     assert document.language_selector.isVisible()
-    assert document.suggest_button.isVisible() and not document.suggest_button.isEnabled()
-    assert document.help_button.isVisible() and not document.help_button.isEnabled()
+    assert_compact_toolbar(document)
     assert "no extension" in document.assist_label.text()
     assert "Choose Python in Language" in document.assist_label.text()
     assert not document._python
@@ -327,7 +335,7 @@ def test_extensionless_file_can_enable_python_completion_and_help_without_reload
     assert changes == ["python"]
     assert document.language_mode == "python"
     assert document._python and document.editor.is_python
-    assert document.suggest_button.isEnabled() and document.help_button.isEnabled()
+    assert_compact_toolbar(document)
     assert document.editor.toPlainText() == before
     assert document.editor.textCursor().position() == position
     assert document.is_modified
@@ -336,15 +344,16 @@ def test_extensionless_file_can_enable_python_completion_and_help_without_reload
     assert token_color(document, 1, 0) == EditorHighlighter.COLORS["keyword"]
     assert token_color(document, 2, 0) == EditorHighlighter.COLORS["builtin"]
 
-    QTest.mouseClick(document.suggest_button, Qt.MouseButton.LeftButton)
+    QTest.keyClick(document.editor, Qt.Key.Key_Space, Qt.KeyboardModifier.ControlModifier)
     wait_for(editor_app, lambda: document._assist_backend == "jedi"
              and document.editor.completer.popup().isVisible() and "sqrt" in completion_names(document))
     choose_completion(document, "sqrt")
     assert document.editor.toPlainText().endswith("math.sqrt")
     set_cursor(document, 2, 2)
     QTest.keyClick(document.editor, Qt.Key.Key_F1)
-    wait_for(editor_app, lambda: "print(" in document.help_text.toPlainText())
-    assert document.help_panel.isVisible()
+    popup = completion_popup(document)
+    wait_for(editor_app, lambda: "print(" in popup.details_text.toPlainText())
+    assert popup.isVisible() and popup.details_only
     assert document.save()
     assert document.path.read_bytes() == raw + b"# unsaved\r\nmath.sqrt"
     document.load()
@@ -413,7 +422,8 @@ def test_language_change_discards_pending_assistance_and_reactivates_safely(edit
         document.request_completion(True)
         wait_for(editor_app, entered.is_set)
         assert document.editor.completer.popup().isVisible()
-        document._show_help("Previous help", "Old documentation")
+        popup = completion_popup(document)
+        popup.set_details("Previous help", "Old documentation")
         document.signature_label.setText("Old signature")
         document.signature_label.show()
         document.editor.set_syntax_diagnostic({"ok": False, "line": 1, "column": 0, "message": "old error"})
@@ -422,7 +432,7 @@ def test_language_change_discards_pending_assistance_and_reactivates_safely(edit
         assert document._document_id == 0
         assert not document.editor.completer.popup().isVisible()
         assert completion_names(document) == []
-        assert not document.help_panel.isVisible() and not document.signature_label.isVisible()
+        assert not popup.isVisible() and not document.signature_label.isVisible()
         assert document.editor._diagnostic is None and not document.syntax_label.isVisible()
         assert not any(timer.isActive() for timer in (
             document._completion_timer, document._signature_timer, document._syntax_timer,

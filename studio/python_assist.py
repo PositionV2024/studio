@@ -17,6 +17,7 @@ import re
 import sys
 import tempfile
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -169,6 +170,89 @@ def _basic_builtin_signature(name: str, argument: int = 0) -> dict[str, Any] | N
             "parameters": list(signature.parameters)}
 
 
+def _completion_detail_result(request: AssistRequest) -> dict[str, Any]:
+    """The selected row's identity stays separate from its inferred definition."""
+
+    return {
+        "completion_name": request.completion_name,
+        "completion_kind": request.completion_kind,
+        "name": request.completion_name,
+        "description": "Documentation is unavailable for this suggestion.",
+        "signatures": [],
+        "docstring": "",
+        "detail_status": "unavailable",
+    }
+
+
+def _builtin_name_is_unambiguous(code: str, name: str) -> bool:
+    """Avoid showing a builtin's documentation for a shadowing user variable.
+
+    This deliberately errs on the side of no fallback documentation for broken
+    or very large buffers. A live Jedi helper can resolve those contexts. No
+    user value, annotation, import, or descriptor is evaluated here.
+    """
+
+    if len(code) > _BASIC_SOURCE_LIMIT:
+        return False
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id == name:
+            return False
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
+            return False
+        if isinstance(node, ast.arg) and node.arg == name:
+            return False
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*" or (alias.asname or alias.name.split(".")[0]) == name:
+                    return False
+        if isinstance(node, ast.ExceptHandler) and node.name == name:
+            return False
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
+            return False
+        if isinstance(node, ast.MatchMapping) and node.rest == name:
+            return False
+    return True
+
+
+def basic_completion_detail(request: AssistRequest) -> dict[str, Any]:
+    """Document trusted Python builtins without loading an optional engine.
+
+    Attribute completions and unknown user names do not inherit documentation
+    merely because their last identifier happens to match a builtin.
+    """
+
+    result = _completion_detail_result(request)
+    name = request.completion_name
+    if not name.isidentifier() or name not in _BUILTINS:
+        return result
+    lines = request.code.split("\n")
+    if not 1 <= request.line <= len(lines):
+        return result
+    before = lines[request.line - 1][:request.column]
+    if re.match(r"^[ \t]*(?:from|import)\b", before):
+        return result
+    prefix = re.search(r"\w*$", before)
+    prefix_start = prefix.start() if prefix else len(before)
+    if prefix_start and before[prefix_start - 1] == ".":
+        return result
+    if not _builtin_name_is_unambiguous(request.code, name):
+        return result
+    value = _BUILTINS[name]
+    signature = _basic_builtin_signature(name)
+    result.update({
+        "name": "builtins." + name,
+        "description": signature["text"] if signature else "Python builtin " + name,
+        "signatures": [signature] if signature else [],
+        "docstring": (getattr(value, "__doc__", "") or "")[:18_000],
+        "detail_status": "ready",
+    })
+    return result
+
+
 def basic_assistance(request: AssistRequest, reason: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "backend": "basic",
@@ -193,6 +277,8 @@ def basic_assistance(request: AssistRequest, reason: str) -> dict[str, Any]:
                                "docstring": (getattr(value, "__doc__", "") or "")[:18_000]}]
         else:
             result["help"] = []
+    if request.action == "completion_detail":
+        result.update(basic_completion_detail(request))
     return result
 
 
@@ -209,6 +295,8 @@ class AssistRequest:
     line: int
     column: int
     cursor_position: int
+    completion_name: str = ""
+    completion_kind: str = ""
 
 
 def syntax_check(code: str, path: str) -> dict[str, Any]:
@@ -246,6 +334,10 @@ class PythonAssistService(QObject):
         self._jedi = None
         self._cache_location = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
         self._projects: dict[tuple[str, str | None], Any] = {}
+        # Accessed only by the serialized worker. These lazy Jedi objects must
+        # never be sent to, or resolved by, the GUI thread. Keeping a few current
+        # snapshots avoids regenerating a large completion list on each hover.
+        self._completion_sets: OrderedDict[tuple[Any, ...], list[Any]] = OrderedDict()
         self._thread = threading.Thread(
             target=self._run, name="Python editor assistance", daemon=True,
         )
@@ -302,7 +394,7 @@ class PythonAssistService(QObject):
         )
 
     def _run(self) -> None:
-        priorities = {"help": 0, "complete": 1, "syntax": 2, "signature": 3}
+        priorities = {"help": 0, "complete": 1, "completion_detail": 2, "syntax": 3, "signature": 4}
         while True:
             with self._condition:
                 self._condition.wait_for(lambda: self._stopping or bool(self._requests))
@@ -321,6 +413,8 @@ class PythonAssistService(QObject):
                 "action": request.action,
                 "cursor_position": request.cursor_position,
             }
+            if request.action == "completion_detail":
+                result.update(_completion_detail_result(request))
             try:
                 if len(request.code) > MAX_ASSIST_CHARACTERS:
                     result["error"] = "Python assistance is paused for files over 500,000 characters."
@@ -420,7 +514,7 @@ class PythonAssistService(QObject):
         )
         result: dict[str, Any] = {}
         if request.action == "complete":
-            completions = script.complete(request.line, request.column)
+            completions = self._completion_candidates(script, request, refresh=True)
             result["completions"] = [
                 {
                     "name": item.name_with_symbols,
@@ -429,6 +523,8 @@ class PythonAssistService(QObject):
                 }
                 for item in completions[:1000]
             ]
+        if request.action == "completion_detail":
+            result.update(self._selected_completion_detail(script, request))
         if request.action in {"complete", "signature"}:
             try:
                 result["signatures"] = [
@@ -454,6 +550,89 @@ class PythonAssistService(QObject):
                 }
                 for item in names[:3]
             ]
+        return result
+
+    def _completion_candidates(self, script: Any, request: AssistRequest, *, refresh: bool = False) -> list[Any]:
+        key = (
+            request.document_id, request.version, request.path, request.project_path,
+            request.python_executable, request.line, request.column, request.code,
+        )
+        if not refresh and key in self._completion_sets:
+            self._completion_sets.move_to_end(key)
+            return self._completion_sets[key]
+        candidates = script.complete(request.line, request.column)[:1000]
+        self._completion_sets[key] = candidates
+        while len(self._completion_sets) > 4:
+            self._completion_sets.popitem(last=False)
+        return candidates
+
+    def _selected_completion_detail(self, script: Any, request: AssistRequest) -> dict[str, Any]:
+        result = _completion_detail_result(request)
+        if not request.completion_name:
+            return result
+        matches = [
+            item for item in self._completion_candidates(script, request)
+            if item.name_with_symbols == request.completion_name
+        ]
+        if not matches:
+            # Immediate native suggestions can remain visible while an engine
+            # is starting. Only trusted builtin fallback names have local docs.
+            return basic_completion_detail(request)
+        selected = next((item for item in matches if item.type == request.completion_kind), matches[0])
+
+        def read_details(item: Any) -> dict[str, Any]:
+            information: dict[str, Any] = {}
+            for field, attribute in (("name", "full_name"), ("description", "description")):
+                try:
+                    value = getattr(item, attribute)
+                    if value:
+                        information[field] = str(value)
+                except Exception:
+                    pass
+            try:
+                information["docstring"] = item.docstring(raw=True, fast=False)[:18_000]
+            except Exception:
+                pass
+            try:
+                information["signatures"] = [
+                    {
+                        "text": signature.to_string(),
+                        "index": getattr(signature, "index", None),
+                        "parameters": [parameter.name for parameter in signature.params],
+                    }
+                    for signature in item.get_signatures()[:3]
+                ]
+            except Exception:
+                pass
+            return information
+
+        information = read_details(selected)
+        # A public API may export a bound method as an assignment, for example
+        # ``bar_chart = _main.bar_chart``. The Completion has type 'statement'
+        # and no docs, while its inferred function has both. Infer only this
+        # selected entry, never the other hundreds of rows in the popup.
+        if not information.get("docstring") or not information.get("signatures"):
+            try:
+                definitions = selected.infer()[:3]
+            except Exception:
+                definitions = []
+            for definition in definitions:
+                details = read_details(definition)
+                if not information.get("docstring") and details.get("docstring"):
+                    information["docstring"] = details["docstring"]
+                if not information.get("signatures") and details.get("signatures"):
+                    information["signatures"] = details["signatures"]
+                if details.get("docstring") or details.get("signatures"):
+                    for field in ("name", "description"):
+                        if details.get(field):
+                            information[field] = details[field]
+                if information.get("docstring") and information.get("signatures"):
+                    break
+        result.update(information)
+        if result["docstring"] or result["signatures"]:
+            result["detail_status"] = "ready"
+        elif not result["description"]:
+            result["description"] = "Documentation is unavailable for this suggestion."
         return result
 
 

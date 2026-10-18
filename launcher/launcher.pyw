@@ -29,11 +29,23 @@ def main() -> int:
     if root_text not in sys.path:
         sys.path.insert(0, root_text)
 
+    launch_guard = None
+    guard_error_type = None
     try:
+        # This stdlib-only module has no studio imports. Acquire the shared
+        # application lock before reading UI modules so a second launch cannot
+        # load a mixture of versions while an update is replacing files.
+        from launcher.update_apply import UpdateError, acquire_running_instance
+
+        guard_error_type = UpdateError
+        launch_guard = acquire_running_instance(project_root)
         from studio.application import run
 
-        return int(run())
-    except Exception:
+        return int(run(launch_guard=launch_guard))
+    except Exception as error:
+        if guard_error_type is not None and isinstance(error, guard_error_type):
+            _show_error("HoYo Project Studio update", str(error))
+            return 1
         error_log = project_root / "launcher_error.log"
         details = traceback.format_exc()
 
@@ -50,6 +62,9 @@ def main() -> int:
             "missing.",
         )
         return 1
+    finally:
+        if launch_guard is not None:
+            launch_guard.close()
 
 
 if __name__ == "__main__":

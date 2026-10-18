@@ -15,9 +15,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox, QCompleter, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
-    QPushButton, QSizePolicy, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from .completion_popup import CompletionPopup
 from .python_assist import (
     AssistRequest, SYNTAX_PYTHON_VERSION, basic_completion_items,
     get_python_assist, shutdown_python_assist,
@@ -81,11 +82,11 @@ QLabel#PythonSignature {
     color: #c8defa; background: #15243b; border: 1px solid #304663;
     border-radius: 4px; padding: 6px 9px;
 }
-QPushButton#CodeEditorActionButton, QPushButton#PythonHelpClose {
+QPushButton#CodeEditorActionButton {
     background: #1b2d47; color: #e3efff; border: 1px solid #344c6b;
     border-radius: 4px; padding: 5px 10px; min-height: 21px;
 }
-QPushButton#CodeEditorActionButton:hover, QPushButton#PythonHelpClose:hover {
+QPushButton#CodeEditorActionButton:hover {
     background: #28476b; border-color: #5f8fc7;
 }
 QPushButton#CodeEditorActionButton:disabled { color: #73829a; background: #162235; }
@@ -94,12 +95,6 @@ QPushButton#PythonSyntaxStatus {
     padding: 2px 4px; text-align: left; font-size: 11px;
 }
 QPushButton#PythonSyntaxStatus[syntaxError="true"] { color: #ff98a8; }
-QWidget#PythonHelpPanel { background: #152034; border: 1px solid #314562; border-radius: 5px; }
-QLabel#PythonHelpTitle { color: #d6e8ff; font-weight: bold; border: none; }
-QTextBrowser#PythonHelpText {
-    background: #101b2c; color: #dce6f5; border: none; padding: 7px;
-    selection-background-color: #304f7a; selection-color: #ffffff;
-}
 """
 
 
@@ -119,6 +114,8 @@ class CodeTextEdit(QPlainTextEdit):
     save_requested = Signal()
     completion_requested = Signal(bool)
     help_requested = Signal()
+    completion_selection_changed = Signal(object)
+    completion_dismissed = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -152,17 +149,17 @@ class CodeTextEdit(QPlainTextEdit):
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.completer.setMaxVisibleItems(10)
         self.completer.activated[QModelIndex].connect(self._accept_completion)
-        popup = self.completer.popup()
-        popup.setFont(font)
-        popup.setStyleSheet("""
-            QAbstractItemView {
-                background: #172439; color: #e1edff; border: 1px solid #597da8;
-                selection-background-color: #2e5688; selection-color: #ffffff;
-                padding: 3px; outline: none;
-            }
-            QAbstractItemView::item { padding: 5px 9px; min-height: 22px; }
-            QAbstractItemView::item:selected { background: #2e5688; color: #ffffff; }
-        """)
+        popup = CompletionPopup()
+        popup.set_code_font(font)
+        popup.entry_highlighted.connect(self.completion_selection_changed)
+        popup.dismissed.connect(self._completion_popup_dismissed)
+        self.completer.setPopup(popup)
+
+    def _completion_popup_dismissed(self) -> None:
+        if self.completer.popup()._updating:
+            return
+        self._completion_anchor = None
+        self.completion_dismissed.emit()
 
     def line_number_area_width(self) -> int:
         return 16 + self.fontMetrics().horizontalAdvance("9") * len(str(max(1, self.blockCount())))
@@ -253,31 +250,64 @@ class CodeTextEdit(QPlainTextEdit):
         self._completion_anchor = None
 
     def show_completions(self, items: list[dict], *, revision: int, cursor_position: int) -> None:
-        selected_name = None
-        if self._completion_anchor == (revision, cursor_position) and self.completer.popup().isVisible():
-            selected = self.completer.popup().currentIndex().data(Qt.ItemDataRole.UserRole)
-            if isinstance(selected, dict):
-                selected_name = selected.get("name")
-        self.hide_completions()
-        self.completion_model.clear()
+        popup = self.completer.popup()
+        selected_identity = None
+        if self._completion_anchor == (revision, cursor_position) and popup.isVisible():
+            selected = popup.selected_entry()
+            if selected:
+                selected_identity = (selected.get("name"), selected.get("kind", ""))
+        if not items or not self.isVisible() or not self.hasFocus():
+            self.hide_completions()
+            return
+        # Keep one visible popup while basic suggestions are enriched by Jedi.
+        # Blocking intermediate selection signals prevents stale detail lookups.
+        popup._updating = True
+        popup.set_details_only(False)
         selected_row = 0
-        for entry in items:
-            if entry["name"] == selected_name:
-                selected_row = self.completion_model.rowCount()
+        exact_selection = False
+        for row, entry in enumerate(items):
+            if (entry["name"], entry.get("kind", "")) == selected_identity:
+                selected_row = row
+                exact_selection = True
+            elif selected_identity and entry["name"] == selected_identity[0] and not exact_selection:
+                # Local fallback entries become more precise Jedi types when
+                # enrichment arrives; retain the user's selected name.
+                selected_row = row
             item = QStandardItem(f"{entry['name']}    {entry.get('kind', '')}")
             item.setData(entry, Qt.ItemDataRole.UserRole)
-            item.setToolTip(f"{entry['name']} ({entry.get('kind', 'symbol')}) — Tab or Enter to insert")
-            self.completion_model.appendRow(item)
-        if not items or not self.isVisible() or not self.hasFocus():
-            return
+            self.completion_model.setItem(row, item)
+        if self.completion_model.rowCount() > len(items):
+            self.completion_model.removeRows(len(items), self.completion_model.rowCount() - len(items))
         self._completion_anchor = (revision, cursor_position)
         self.completer.setCompletionPrefix("")
         rect = self.cursorRect()
-        rect.setWidth(min(610, max(320, self.viewport().width() - rect.left() - 12)))
+        rect.setWidth(780)
         self.completer.complete(rect)
-        self.completer.popup().setCurrentIndex(self.completer.completionModel().index(selected_row, 0))
+        popup.setCurrentIndex(self.completer.completionModel().index(selected_row, 0))
+        popup.fit_to_editor(self)
+        popup._updating = False
+        selected = popup.selected_entry()
+        if selected:
+            self.completion_selection_changed.emit(selected)
+
+    def show_context_help(self, title: str, text: str) -> None:
+        """Show F1 documentation in the same popup used for completion details."""
+
+        popup = self.completer.popup()
+        popup._updating = True
+        popup.set_details_only(True)
+        self.completion_model.clear()
+        self._completion_anchor = (self.document().revision(), self.textCursor().position())
+        popup.set_details(title, text)
+        popup.fit_to_editor(self)
+        popup.show()
+        popup.raise_()
+        popup._updating = False
 
     def _accept_completion(self, index: QModelIndex) -> None:
+        if self.completer.popup().details_only:
+            self.hide_completions()
+            return
         context = self._completion_anchor
         if context is None or context != (self.document().revision(), self.textCursor().position()):
             self.hide_completions()
@@ -425,10 +455,24 @@ class CodeTextEdit(QPlainTextEdit):
             event.accept()
             return
         if self.completer.popup().isVisible():
-            if event.key() in {Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Tab} and not shift:
+            popup = self.completer.popup()
+            if not popup.details_only and not ctrl and event.key() in {Qt.Key.Key_Up, Qt.Key.Key_Down}:
+                count = self.completer.completionModel().rowCount()
+                if count:
+                    step = -1 if event.key() == Qt.Key.Key_Up else 1
+                    row = (popup.currentIndex().row() + step) % count
+                    self.completer.setCurrentRow(row)
+                    popup.setCurrentIndex(self.completer.completionModel().index(row, 0))
+                    popup.scrollTo(popup.currentIndex())
+                event.accept()
+                return
+            if (not self.completer.popup().details_only
+                    and event.key() in {Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Tab} and not shift):
                 self._accept_completion(self.completer.popup().currentIndex())
                 event.accept()
                 return
+            if self.completer.popup().details_only:
+                self.hide_completions()
             if event.key() == Qt.Key.Key_Escape:
                 self.hide_completions()
                 event.accept()
@@ -479,20 +523,29 @@ class CodeEditorDocument(QWidget):
     status_message = Signal(str)
     saved = Signal(object)
     language_changed = Signal(str)
+    test_script_requested = Signal(object)
 
     def __init__(self, path: Path, parent=None, *, project_path: Path | None = None,
-                 python_executable: str | Path | None = None) -> None:
+                 python_executable: str | Path | None = None,
+                 script_python_executable: str | Path | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("CodeEditorDocument")
         self.setStyleSheet(EDITOR_STYLE)
         self.path = Path(path).expanduser().resolve()
         self.project_path = Path(project_path).expanduser().resolve() if project_path else self.path.parent
         self.python_executable = str(python_executable) if python_executable else None
+        # Running must retain an explicitly configured interpreter even when it
+        # is missing; completion can continue to use its existing fallback.
+        self.script_python_executable = (
+            str(script_python_executable) if script_python_executable else self.python_executable
+        )
         self.encoding = "utf-8"
         self.newline = "\n"
         self._loading = False
         self._loaded_successfully = False
         self._closed = False
+        self._script_test_busy = False
+        self._runtime_preparing = ""
         self._version = 0
         self._request_counter = 0
         self._last_request: dict[str, int] = {}
@@ -500,6 +553,8 @@ class CodeEditorDocument(QWidget):
         self._assist_backend: str | None = None
         self._assist_status = ""
         self._assist_detail = ""
+        self._selected_completion_identity: tuple[str, str] | None = None
+        self._completion_detail_cache: dict[tuple, dict] = {}
         self._language_mode = "auto"
         self._python = self.path.suffix.lower() in {".py", ".pyw", ".pyi"}
         self._service = None
@@ -533,16 +588,16 @@ class CodeEditorDocument(QWidget):
 
         self.save_button = self._action_button("Save", "Save this file (Ctrl+S)", self.save)
         self.reload_button = self._action_button("Reload", "Reload the file from disk", self.reload)
-        self.suggest_button = self._action_button("Suggest", "Python completion (Ctrl+Space). Tab or Enter inserts; Esc dismisses.",
-                                                 lambda: self.request_completion(True))
-        self.help_button = self._action_button("Python Help", "Documentation for the name under the cursor (F1 or Ctrl+Q)",
-                                              self.request_help)
+        self.test_script_button = self._action_button(
+            "Test Script", "Save changes and run this Python script (F7)", self.request_script_test,
+        )
+        self.test_script_button.setAccessibleName("Test this Python script")
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.addWidget(self.path_label, 1)
         header.addWidget(language_label)
         header.addWidget(self.language_selector)
-        for button in (self.suggest_button, self.help_button, self.reload_button, self.save_button):
+        for button in (self.test_script_button, self.reload_button, self.save_button):
             header.addWidget(button)
 
         self.editor = CodeTextEdit()
@@ -552,6 +607,8 @@ class CodeEditorDocument(QWidget):
         self.editor.save_requested.connect(self.save)
         self.editor.completion_requested.connect(self.request_completion)
         self.editor.help_requested.connect(self.request_help)
+        self.editor.completion_selection_changed.connect(self._completion_selected)
+        self.editor.completion_dismissed.connect(self._completion_dismissed)
         self.editor.document().modificationChanged.connect(self._modified_changed)
         self.editor.textChanged.connect(self._text_changed)
         self.editor.cursorPositionChanged.connect(self._cursor_changed)
@@ -561,29 +618,6 @@ class CodeEditorDocument(QWidget):
         self.signature_label.setTextFormat(Qt.TextFormat.RichText)
         self.signature_label.setWordWrap(True)
         self.signature_label.hide()
-
-        self.help_panel = QWidget()
-        self.help_panel.setObjectName("PythonHelpPanel")
-        help_layout = QVBoxLayout(self.help_panel)
-        help_layout.setContentsMargins(8, 6, 8, 5)
-        help_layout.setSpacing(4)
-        help_header = QHBoxLayout()
-        self.help_title = QLabel("Python Help")
-        self.help_title.setObjectName("PythonHelpTitle")
-        help_close = QPushButton("Close")
-        help_close.setObjectName("PythonHelpClose")
-        help_close.clicked.connect(self.help_panel.hide)
-        help_header.addWidget(self.help_title, 1)
-        help_header.addWidget(help_close)
-        self.help_text = QTextBrowser()
-        self.help_text.setObjectName("PythonHelpText")
-        self.help_text.setOpenExternalLinks(False)
-        self.help_text.setFont(self.editor.font())
-        self.help_text.setMinimumHeight(115)
-        self.help_text.setMaximumHeight(200)
-        help_layout.addLayout(help_header)
-        help_layout.addWidget(self.help_text)
-        self.help_panel.hide()
 
         self.status_label = QLabel()
         self.status_label.setObjectName("CodeEditorStatus")
@@ -612,11 +646,11 @@ class CodeEditorDocument(QWidget):
         layout.addLayout(header)
         layout.addWidget(self.editor, 1)
         layout.addWidget(self.signature_label)
-        layout.addWidget(self.help_panel)
         layout.addLayout(footer)
         layout.addWidget(self.assist_label)
 
         self._completion_timer = self._timer(220, self._submit_completion)
+        self._completion_detail_timer = self._timer(160, self._submit_completion_detail)
         self._signature_timer = self._timer(350, lambda: self._submit("signature"))
         self._syntax_timer = self._timer(550, lambda: self._submit("syntax"))
         self.highlighter: EditorHighlighter | None = None
@@ -624,6 +658,7 @@ class CodeEditorDocument(QWidget):
             self._enable_python_assist()
         self._set_assist_ready()
         self.load()
+        self._update_script_test_button()
 
     def _action_button(self, text: str, tooltip: str, callback) -> QPushButton:
         button = QPushButton(text)
@@ -638,6 +673,43 @@ class CodeEditorDocument(QWidget):
         timer.setInterval(interval)
         timer.timeout.connect(callback)
         return timer
+
+    @property
+    def can_test_script(self) -> bool:
+        return (
+            self._python and self._loaded_successfully
+            and not self._closed and not self._script_test_busy and not self._runtime_preparing
+        )
+
+    def set_script_test_busy(self, busy: bool) -> None:
+        """Keep all editor buttons in sync with the shared script process."""
+
+        self._script_test_busy = bool(busy)
+        self._update_script_test_button()
+
+    def _update_script_test_button(self) -> None:
+        self.test_script_button.setEnabled(self.can_test_script)
+        if self._script_test_busy:
+            tooltip = "A script test is running. Stop it in the Script Test panel before starting another."
+        elif self._runtime_preparing:
+            tooltip = self._runtime_preparing
+        elif not self._python:
+            tooltip = "Choose Python in Language to test this file."
+        else:
+            tooltip = (
+                "Save changes and run this Python script (F7). "
+                "Output and errors appear in the Script Test panel."
+            )
+        self.test_script_button.setToolTip(tooltip)
+
+    def set_runtime_preparing(self, message: str) -> None:
+        self._runtime_preparing = message
+        self._update_script_test_button()
+
+    def request_script_test(self) -> None:
+        if self.can_test_script:
+            self.editor.hide_completions()
+            self.test_script_requested.emit(self)
 
     def _enable_python_assist(self) -> None:
         if self._document_id:
@@ -699,8 +771,7 @@ class CodeEditorDocument(QWidget):
         self.editor.set_syntax_diagnostic(None)
         self.signature_label.clear()
         self.signature_label.hide()
-        self.help_text.clear()
-        self.help_panel.hide()
+        self.editor.completer.popup().set_details("Python completion", "")
         self.syntax_label.setVisible(self._python)
         self.syntax_label.setProperty("syntaxError", False)
         self.syntax_label.style().unpolish(self.syntax_label)
@@ -723,6 +794,7 @@ class CodeEditorDocument(QWidget):
             self._syntax_timer.start(120)
         self._set_assist_ready()
         self._update_cursor_status()
+        self._update_script_test_button()
         self.language_changed.emit(mode)
         self.editor.setFocus()
 
@@ -786,9 +858,9 @@ class CodeEditorDocument(QWidget):
         self._replace_highlighter()
         self._loading = False
         self._loaded_successfully = True
+        self._update_script_test_button()
         self.editor.set_syntax_diagnostic(None)
         self.signature_label.hide()
-        self.help_panel.hide()
         if self._python:
             self.syntax_label.setText("Syntax check: checking…")
             self._syntax_timer.start(120)
@@ -859,7 +931,9 @@ class CodeEditorDocument(QWidget):
         if self._closed:
             return
         self._closed = True
+        self._update_script_test_button()
         self._completion_timer.stop()
+        self._completion_detail_timer.stop()
         self._signature_timer.stop()
         self._syntax_timer.stop()
         self.editor.hide_completions()
@@ -869,6 +943,9 @@ class CodeEditorDocument(QWidget):
         self._version += 1
         self._last_request.clear()
         self._completion_timer.stop()
+        self._completion_detail_timer.stop()
+        self._selected_completion_identity = None
+        self._completion_detail_cache.clear()
         self._signature_timer.stop()
         self._syntax_timer.stop()
         self.editor.hide_completions()
@@ -917,8 +994,6 @@ class CodeEditorDocument(QWidget):
         )
 
     def _set_assist_ready(self) -> None:
-        self.suggest_button.setEnabled(self._python)
-        self.help_button.setEnabled(self._python)
         if not self._python:
             if self._language_mode == "plain":
                 explanation = "Plain text mode."
@@ -1005,13 +1080,97 @@ class CodeEditorDocument(QWidget):
     def request_help(self) -> None:
         if not self._python or self._closed:
             return
+        popup = self.editor.completer.popup()
+        if popup.isVisible() and not popup.details_only and popup.selected_entry():
+            self._completion_detail_timer.stop()
+            self._submit_completion_detail()
+            return
         self.editor.hide_completions()
         if not self._service:
             return
-        self._show_help("Python Help", "Looking up documentation for the name at the cursor…")
+        self.editor.setFocus()
+        self.editor.show_context_help("Python documentation", "Looking up documentation for the name at the cursor…")
         self._submit("help")
 
-    def _submit(self, action: str) -> None:
+    def _completion_dismissed(self) -> None:
+        self._completion_timer.stop()
+        self._completion_detail_timer.stop()
+        self._selected_completion_identity = None
+        self._completion_detail_cache.clear()
+        self._last_request.pop("complete", None)
+        self._last_request.pop("completion_detail", None)
+        self._last_request.pop("help", None)
+
+    def _completion_selected(self, entry: dict) -> None:
+        if self._closed or not self._python:
+            return
+        popup = self.editor.completer.popup()
+        if not popup.isVisible() or popup.details_only:
+            return
+        identity = (entry["name"], entry.get("kind", ""))
+        cursor_position = self.editor.textCursor().position()
+        cache_key = (self._version, cursor_position, *identity)
+        if self._selected_completion_identity == identity:
+            # Retain the readable details and scroll position when Jedi enriches
+            # the existing completion list without changing the selected row.
+            if cache_key in self._completion_detail_cache or self._completion_detail_timer.isActive():
+                return
+        self._selected_completion_identity = identity
+        self._completion_detail_timer.stop()
+        self._last_request.pop("completion_detail", None)
+        if cache_key in self._completion_detail_cache:
+            self._display_completion_detail(self._completion_detail_cache[cache_key])
+            return
+        name, kind = identity
+        popup.set_details(f"{name}  ·  {kind or 'Python symbol'}", "Loading documentation…")
+        self._completion_detail_timer.start()
+
+    def _submit_completion_detail(self) -> None:
+        popup = self.editor.completer.popup()
+        entry = popup.selected_entry()
+        if (self._closed or not self._python or not popup.isVisible() or entry is None
+                or self.editor._completion_anchor != (
+                    self.editor.document().revision(), self.editor.textCursor().position(),
+                )):
+            return
+        identity = (entry["name"], entry.get("kind", ""))
+        if identity != self._selected_completion_identity:
+            return
+        self._submit("completion_detail", completion_name=identity[0], completion_kind=identity[1])
+
+    def _display_completion_detail(self, result: dict) -> None:
+        name = result.get("completion_name") or result.get("name", "Python symbol")
+        kind = result.get("completion_kind", "")
+        signatures = [entry["text"] for entry in result.get("signatures", []) if entry.get("text")]
+        if kind == "statement" and signatures:
+            kind = "function"
+        description = result.get("description", "")
+        docstring = result.get("docstring", "").strip()
+        sections = []
+        # Give the first sentence room before a long API signature. Remaining
+        # parameters and examples stay scrollable in this same details pane.
+        if docstring:
+            summary, separator, remainder = docstring.partition("\n\n")
+            if separator and len(summary) <= 220 and not summary.lstrip().startswith(name + "("):
+                sections.append(summary)
+                docstring = remainder.strip()
+        if signatures:
+            sections.append("\n".join(signatures))
+        elif description:
+            sections.append(description)
+        if docstring:
+            sections.append(docstring)
+        elif result.get("detail_status") == "unavailable":
+            if description and description not in sections:
+                sections.append(description)
+            sections.append("Documentation is unavailable for this suggestion. You can still insert it.")
+        else:
+            sections.append("No docstring is available for this symbol.")
+        self.editor.completer.popup().set_details(
+            f"{name}  ·  {kind or 'Python symbol'}", "\n\n".join(sections),
+        )
+
+    def _submit(self, action: str, *, completion_name: str = "", completion_kind: str = "") -> None:
         if self._closed or self._loading or not self._python or self._service is None:
             return
         if action in {"complete", "signature"} and (not self.isVisible() or not self.editor.hasFocus()):
@@ -1027,6 +1186,7 @@ class CodeEditorDocument(QWidget):
             line=cursor.blockNumber() + 1,
             column=codepoint_column(cursor.block().text(), cursor.positionInBlock()),
             cursor_position=cursor.position(),
+            completion_name=completion_name, completion_kind=completion_kind,
         ))
 
     def _on_assist_result(self, result: dict) -> None:
@@ -1039,6 +1199,28 @@ class CodeEditorDocument(QWidget):
             return
         if action in {"complete", "signature"} and (not self.isVisible() or not self.editor.hasFocus()):
             return
+        popup = self.editor.completer.popup()
+        if action == "completion_detail":
+            entry = popup.selected_entry()
+            identity = (result.get("completion_name"), result.get("completion_kind", ""))
+            if (not popup.isVisible() or popup.details_only or entry is None
+                    or identity != self._selected_completion_identity
+                    or identity != (entry.get("name"), entry.get("kind", ""))
+                    or self.editor._completion_anchor != (
+                        self.editor.document().revision(), self.editor.textCursor().position(),
+                    )):
+                return
+            if result.get("error"):
+                popup.set_details(identity[0], f"Documentation is unavailable.\n\n{result['error']}")
+            else:
+                cache_key = (self._version, result["cursor_position"], *identity)
+                if len(self._completion_detail_cache) >= 32:
+                    self._completion_detail_cache.pop(next(iter(self._completion_detail_cache)))
+                self._completion_detail_cache[cache_key] = result
+                self._display_completion_detail(result)
+            return
+        if action == "help" and (not popup.isVisible() or not popup.details_only):
+            return
         if result.get("error"):
             if action == "syntax":
                 self.syntax_label.setText("Syntax check: unavailable")
@@ -1046,7 +1228,7 @@ class CodeEditorDocument(QWidget):
             else:
                 self.assist_label.setText(result["error"])
                 if action == "help":
-                    self._show_help("Python Help unavailable", result["error"])
+                    popup.set_details("Python documentation unavailable", result["error"])
             return
         if action == "syntax":
             diagnostic = result["diagnostic"]
@@ -1071,6 +1253,9 @@ class CodeEditorDocument(QWidget):
         self._set_assist_ready()
         if action == "complete":
             items = result.get("completions", [])
+            # A fresh completion pass can observe saved changes in other project
+            # modules, even if this editor's own text and cursor are unchanged.
+            self._completion_detail_cache.clear()
             self.editor.show_completions(items, revision=self.editor.document().revision(),
                                          cursor_position=result["cursor_position"])
             if not items and self._manual_completion:
@@ -1092,17 +1277,12 @@ class CodeEditorDocument(QWidget):
         if action == "help":
             entries = result.get("help", [])
             if not entries:
-                self._show_help("Python Help", "No documentation found at this position.\n\nPlace the cursor on a Python name, function, class, or keyword, then press F1.\n\n"
+                popup.set_details("Python documentation", "No documentation found at this position.\n\nPlace the cursor on a Python name, function, class, or keyword, then press F1.\n\n"
                                 "For project functions, add a docstring below the function definition to make your own documentation available here.")
             else:
                 sections = [f"{entry['name']}\n{entry['description']}\n\n{entry['docstring'] or 'No docstring is available for this symbol.'}"
                             for entry in entries]
-                self._show_help(f"Python Help — {entries[0]['name']}", "\n\n".join(sections))
-
-    def _show_help(self, title: str, text: str) -> None:
-        self.help_title.setText(title)
-        self.help_text.setPlainText(text)
-        self.help_panel.show()
+                popup.set_details(entries[0]["name"], "\n\n".join(sections))
 
     def _jump_to_diagnostic(self) -> None:
         cursor = self.editor.diagnostic_cursor()

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QSettings, QSignalBlocker, QStandardPaths, Qt, QUrl
+from PySide6.QtCore import QSize, QSettings, QSignalBlocker, QStandardPaths, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,6 +19,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QLineEdit,
     QPlainTextEdit,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QStyle,
@@ -44,6 +47,8 @@ from .project_explorer import ProjectExplorer
 from .project_library import ProjectLibrary, ProjectRecord
 from .project_manifest import ProjectManifest, load_manifest, save_manifest
 from .project_runner import ProjectRunner
+from .script_runner import ScriptRunner
+from .script_test_panel import ScriptTestPanel
 from .settings_store import SettingsStore
 from .styles import APP_STYLE
 from .terminal_console import TerminalConsole
@@ -68,6 +73,13 @@ class MainWindow(QMainWindow):
         self.runner = ProjectRunner(self)
         self.current_project: ProjectRecord | None = None
         self.current_settings: SettingsStore | None = None
+        self._visual_settings: dict[Path, SettingsStore] = {}
+        self._visual_project_names: dict[Path, str] = {}
+        self._visual_selection_project: Path | None = None
+        self._inline_visual_owner: tuple[Path, str] | None = None
+        self._inline_pending = False
+        self._visual_commit_in_progress = False
+        self._closing_approved = False
         self.open_editors: dict[Path, CodeEditorDocument] = {}
         self._preview_user_closed = False
 
@@ -92,12 +104,18 @@ class MainWindow(QMainWindow):
         self.preview = PreviewView(app_root / "resources")
         self.preview.element_selected.connect(self._element_selected)
         self.preview.browser_message.connect(self._append_log)
-        self.preview.preview_loaded.connect(
-            lambda url: self.statusBar().showMessage(f"Preview loaded: {url}")
-        )
+        self.preview.preview_loaded.connect(self._preview_loaded)
+        self.preview.inline_edit_started.connect(self._inline_edit_started)
+        self.preview.inline_patch_changed.connect(self._inline_text_changed)
+        self.preview.inline_edit_finished.connect(self._inline_edit_finished)
+        self.preview.inline_pending_changed.connect(self._inline_pending_changed)
 
         self.inspector = PropertyInspector()
         self.inspector.patch_changed.connect(self._property_changed)
+        self.inspector.save_requested.connect(lambda: self.save_visual_changes())
+        self.inspector.pending_edits_changed.connect(
+            lambda _pending: self._update_visual_save_state()
+        )
 
         self.logs = QPlainTextEdit()
         self.logs.setObjectName("OutputPanel")
@@ -117,6 +135,7 @@ class MainWindow(QMainWindow):
         self.bottom_tabs.setMovable(False)
         self.bottom_tabs.addTab(self.logs, "Output")
         self.bottom_tabs.addTab(self.console, "Console")
+        self._setup_script_testing()
 
         self.workspace = self._build_workspace()
         self.welcome = WelcomePage()
@@ -141,6 +160,138 @@ class MainWindow(QMainWindow):
 
         self._reload_library()
         self.show_welcome()
+        self._initialize_updates()
+
+    def _initialize_updates(self) -> None:
+        from .update_dialog import UpdateController
+
+        self.update_controller = UpdateController(
+            self.app_root, self.ui_settings, self,
+        )
+        self._update_restart_requested = None
+        self._waiting_for_update_shutdown = False
+        self.update_controller.state_changed.connect(self._update_button_state)
+        self.update_controller.restart_requested.connect(self._restart_for_update)
+        self.update_controller.idle.connect(self._update_worker_idle)
+        self._update_button_state()
+
+    def open_update_dialog(self) -> None:
+        controller = getattr(self, "update_controller", None)
+        if controller is None:
+            self._initialize_updates()
+            controller = self.update_controller
+        controller.open_dialog()
+
+    def _update_button_state(self, _state: str = "") -> None:
+        controller = getattr(self, "update_controller", None)
+        action = getattr(self, "update_action", None)
+        if controller is not None and action is not None:
+            action.setText(controller.button_text)
+            action.setToolTip(controller.button_tooltip)
+
+    def _restart_for_update(self, prepared) -> None:
+        controller = getattr(self, "update_controller", None)
+        if (
+            controller is None
+            or controller.pending_update is not prepared
+            or getattr(self, "_closing_approved", False)
+        ):
+            return
+        self._update_restart_requested = prepared
+        self.close()
+        # Save/Discard/Cancel belongs to the normal application close path.
+        # A cancelled close leaves the downloaded update available for later.
+        if (
+            not getattr(self, "_closing_approved", False)
+            and self._update_restart_requested is prepared
+        ):
+            self._update_restart_requested = None
+            controller.cancel_restart("Restart cancelled. Your update is still ready.")
+
+    def _update_worker_idle(self) -> None:
+        if getattr(self, "_waiting_for_update_shutdown", False):
+            self._waiting_for_update_shutdown = False
+            QTimer.singleShot(0, self.close)
+
+    def _set_closing_controls_enabled(self, enabled: bool) -> None:
+        self.centralWidget().setEnabled(enabled)
+        self.menuBar().setEnabled(enabled)
+        for toolbar in self.findChildren(QToolBar):
+            toolbar.setEnabled(enabled)
+
+    def start_background_setup(self) -> None:
+        """Finish Preview packages after the source application's window opens."""
+
+        if getattr(sys, "frozen", False) or getattr(self, "_closing_approved", False):
+            return
+        controller = getattr(self, "background_setup", None)
+        if controller is None:
+            from .background_setup import BackgroundSetupController, StartupBanner
+
+            self.background_setup = BackgroundSetupController(self.app_root, self)
+            controller = self.background_setup
+            self.startup_banner = StartupBanner(controller, self)
+            content = self.takeCentralWidget()
+            container = QWidget(self)
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            layout.addWidget(self.startup_banner)
+            if content is not None:
+                layout.addWidget(content, 1)
+            self.setCentralWidget(container)
+            controller.state_changed.connect(self._background_setup_state_changed)
+            controller.log_received.connect(lambda message: self._append_log(f"[Setup] {message}\n"))
+            controller.finished.connect(self._background_setup_finished)
+        controller.start()
+
+    def _setup_runtime_blocked(
+        self, executable: str | Path | None = None, *, project_path: Path | None = None,
+    ) -> bool:
+        controller = getattr(self, "background_setup", None)
+        if controller is None or not controller.blocks_runtime:
+            return False
+        if not executable:
+            return True
+        path = Path(executable).expanduser()
+        if not path.is_absolute():
+            base = project_path or self.app_root
+            candidate = base / path
+            command = shutil.which(str(path)) if path.name == str(path) and not candidate.is_file() else None
+            path = Path(command) if command else candidate
+        # Keep the virtual-environment path: resolving a POSIX python symlink
+        # could falsely identify an independent project environment as Studio's.
+        path = Path(os.path.abspath(path))
+        roots = (Path(os.path.abspath(self.app_root / ".venv")), Path(os.path.abspath(sys.prefix)))
+        return any(path.is_relative_to(root) for root in roots)
+
+    def _selected_setup_blocked(self) -> bool:
+        if getattr(self, "background_setup", None) is None or self.current_project is None:
+            return False
+        manifest = load_manifest(self.current_project.path)
+        if manifest is None:
+            return False
+        try:
+            executable = self.runner._discover_python(self.current_project.path, manifest)
+        except RuntimeError:
+            return False
+        return self._setup_runtime_blocked(executable, project_path=self.current_project.path)
+
+    def _background_setup_state_changed(self, state: str) -> None:
+        self._update_project_actions()
+        messages = {
+            "checking": "Preparing Preview support. You can continue editing files.",
+            "running": "Preparing Preview support. You can continue editing files.",
+            "cancelling": "Stopping setup safely...",
+            "ready": "Preview support is ready.",
+            "failed": "Preview setup could not finish. Choose Retry in the setup banner.",
+            "cancelled": "Preview setup was stopped. Your files are still available.",
+        }
+        self.statusBar().showMessage(messages.get(state, "Ready"), 8000)
+
+    def _background_setup_finished(self, _success: bool) -> None:
+        if getattr(self, "_waiting_for_setup_shutdown", False):
+            QTimer.singleShot(0, self.close)
 
     def _build_workspace(self) -> QWidget:
         # Every major workspace area is separated by a visible QSplitter handle.
@@ -158,11 +309,10 @@ class MainWindow(QMainWindow):
         self.document_tabs.currentChanged.connect(
             self._document_tab_changed
         )
-        self.document_tabs.addTab(self.preview, "Preview")
-        self.document_tabs.setTabToolTip(
-            0,
-            "Live Streamlit preview. Closing this tab does not stop the project.",
-        )
+        # Keep the reusable browser owned by the window, but only show its tab
+        # while a preview is starting or running.
+        self.preview.setParent(self.document_tabs)
+        self.preview.hide()
 
         self.center_splitter = QSplitter(Qt.Orientation.Vertical)
         self.center_splitter.setObjectName("CenterWorkspaceSplitter")
@@ -224,16 +374,32 @@ class MainWindow(QMainWindow):
         self._update_project_actions()
         return index
 
+    def _close_preview_tab(self, *, user_initiated: bool = False) -> None:
+        """Detach the stopped/hidden page and invalidate its pending callbacks."""
+
+        if not self._commit_visual_fields() and user_initiated:
+            self._show_inline_commit_error()
+            return
+        self.preview.stop_preview()
+        index = self._preview_tab_index()
+        if index >= 0:
+            self.document_tabs.removeTab(index)
+        if user_initiated:
+            self._preview_user_closed = True
+        if hasattr(self, "edit_action") and self.edit_action.isChecked():
+            with QSignalBlocker(self.edit_action):
+                self.edit_action.setChecked(False)
+            self.preview.set_edit_mode(False)
+        self._clear_visual_selection(force=True)
+        self._update_project_actions()
+
     def _close_workspace_tab(self, index: int) -> None:
         widget = self.document_tabs.widget(index)
         if widget is None:
             return
 
         if widget is self.preview:
-            self.document_tabs.removeTab(index)
-            self._preview_user_closed = True
-            if hasattr(self, "edit_action") and self.edit_action.isChecked():
-                self.edit_action.setChecked(False)
+            self._close_preview_tab(user_initiated=True)
             running = self.runner.running_project_name
             message = "Preview tab closed"
             if running:
@@ -253,6 +419,7 @@ class MainWindow(QMainWindow):
             self._update_project_actions()
 
     def _document_tab_changed(self, _index: int) -> None:
+        self._update_script_test_actions()
         if not hasattr(self, "run_action"):
             return
         if (
@@ -326,10 +493,15 @@ class MainWindow(QMainWindow):
             self,
             project_path=project_path,
             python_executable=python_executable,
+            script_python_executable=manifest.python_executable or python_executable,
         )
         editor.language_changed.connect(
             lambda mode, target=path: self._remember_editor_language(target, mode)
         )
+        editor.language_changed.connect(lambda _mode: self._update_script_test_actions())
+        editor.test_script_requested.connect(self.test_current_script)
+        script_runner = getattr(self, "script_runner", None)
+        editor.set_script_test_busy(bool(script_runner and script_runner.is_running))
         editor.set_language_mode(self._editor_language_overrides().get(str(path), "auto"))
         editor.title_changed.connect(
             lambda title, document=editor: self._update_editor_tab_title(
@@ -429,12 +601,128 @@ class MainWindow(QMainWindow):
         editor = self._current_editor()
         if editor is not None:
             editor.save()
+        elif self.document_tabs.currentWidget() is self.preview:
+            self.save_visual_changes()
 
     def _save_all_documents(self) -> None:
         for editor in list(self.open_editors.values()):
             if editor.is_modified and not editor.save():
                 return
         self.statusBar().showMessage("All open files saved")
+
+    def _setup_script_testing(self) -> None:
+        """Create a separate process and output panel for individual scripts."""
+
+        if getattr(self, "script_runner", None) is None:
+            self.script_runner = ScriptRunner(self)
+        if getattr(self, "script_test_panel", None) is None:
+            self.script_test_panel = ScriptTestPanel(self.script_runner, self)
+            self.script_runner.state_changed.connect(self._script_test_state_changed)
+            self.script_runner.failed.connect(
+                lambda message: self.statusBar().showMessage(f"Script test: {message}")
+            )
+            self.script_runner.finished.connect(self._script_test_finished)
+        bottom_tabs = getattr(self, "bottom_tabs", None)
+        if bottom_tabs is not None and bottom_tabs.indexOf(self.script_test_panel) < 0:
+            bottom_tabs.addTab(self.script_test_panel, "Script Test")
+        self._update_script_test_actions()
+
+    def _ensure_script_test_panel(self) -> ScriptTestPanel:
+        self._setup_script_testing()
+        return self.script_test_panel
+
+    def _show_script_test_panel(self) -> None:
+        panel = self._ensure_script_test_panel()
+        bottom_tabs = getattr(self, "bottom_tabs", None)
+        if bottom_tabs is not None:
+            bottom_tabs.setCurrentWidget(panel)
+            self._set_panel_visible("output", True, persist=False)
+        self.show_workspace()
+        splitter = getattr(self, "center_splitter", None)
+        if splitter is not None:
+            sizes = splitter.sizes()
+            if len(sizes) > 1 and sizes[1] < 250:
+                total = sum(sizes)
+                output_height = min(280, max(180, total // 3))
+                splitter.setSizes([max(120, total - output_height), output_height])
+
+    def test_current_script(self, editor: CodeEditorDocument | None = None) -> bool:
+        """Save and run exactly the selected document in its original project."""
+
+        editor = editor if isinstance(editor, CodeEditorDocument) else self._current_editor()
+        if editor is None:
+            self.statusBar().showMessage("Open a Python script in an editor tab, then choose Test Script.")
+            return False
+        if self._setup_runtime_blocked(editor.script_python_executable, project_path=editor.project_path):
+            self.statusBar().showMessage("This Python environment is still being prepared. You can continue editing files.")
+            return False
+        panel = self._ensure_script_test_panel()
+        if self.script_runner.is_running:
+            self._show_script_test_panel()
+            self.statusBar().showMessage("A script test is already running. Use Stop before starting another.")
+            return False
+        if not editor.can_test_script:
+            self.statusBar().showMessage(
+                "Choose Python in the editor's Language selector to test this file."
+                if not editor.editor.is_python else "This editor is not ready to run a script."
+            )
+            return False
+
+        # Save only this buffer. Other tabs may contain unfinished work, and the
+        # selected sidebar project may differ from the one this tab belongs to.
+        if editor.is_modified and not editor.save():
+            self.statusBar().showMessage("Script test cancelled because the file could not be saved.")
+            return False
+        editor.editor.hide_completions()
+        panel.prepare_run(editor.path, editor.project_path)
+        self._show_script_test_panel()
+        accepted = self.script_runner.start(
+            editor.path, editor.project_path, editor.script_python_executable,
+        )
+        self._update_script_test_actions()
+        return accepted
+
+    def stop_script_test(self) -> None:
+        runner = getattr(self, "script_runner", None)
+        if runner is None or not runner.is_running:
+            return
+        self._show_script_test_panel()
+        runner.stop()
+
+    def _script_test_state_changed(self, state: str) -> None:
+        self._update_script_test_actions()
+        if state in {"starting", "running", "stopping"}:
+            path = self.script_runner.script_path
+            name = path.name if path is not None else "script"
+            messages = {"starting": "Starting", "running": "Testing", "stopping": "Stopping"}
+            self.statusBar().showMessage(f"{messages[state]} {name} — Script Test")
+
+    def _script_test_finished(self, path: str, exit_code: int, stopped: bool) -> None:
+        self._update_script_test_actions()
+        succeeded = exit_code == 0 and self.script_runner.state != "failed"
+        result = "stopped" if stopped else "finished successfully" if succeeded else "failed"
+        self.statusBar().showMessage(
+            f"{Path(path).name} {result} (exit code {exit_code}). See Script Test for output."
+        )
+
+    def _update_script_test_actions(self) -> None:
+        runner = getattr(self, "script_runner", None)
+        running = bool(runner and runner.is_running)
+        for document in list(getattr(self, "open_editors", {}).values()):
+            document.set_script_test_busy(running)
+            blocked = self._setup_runtime_blocked(document.script_python_executable, project_path=document.project_path)
+            document.set_runtime_preparing(
+                "This Python environment is being prepared. You can continue editing files."
+                if blocked else ""
+            )
+        tabs = getattr(self, "document_tabs", None)
+        current = self._current_editor() if tabs is not None else None
+        action = getattr(self, "test_script_action", None)
+        if action is not None:
+            action.setEnabled(current is not None and current.can_test_script and not running)
+        stop_action = getattr(self, "stop_script_test_action", None)
+        if stop_action is not None:
+            stop_action.setEnabled(running)
 
     def _close_current_tab(self) -> None:
         index = self.document_tabs.currentIndex()
@@ -451,7 +739,7 @@ class MainWindow(QMainWindow):
         """Reopen the preview tab without restarting Streamlit."""
 
         url = self.runner.preview_url
-        if not url:
+        if not url or not self.runner.is_preview_running or self.runner.is_stopping:
             QMessageBox.information(
                 self,
                 "No running preview",
@@ -464,13 +752,13 @@ class MainWindow(QMainWindow):
             select=True,
             title=f"Preview — {project_name}",
         )
-        if self.preview.current_preview_url != url:
+        if not self.preview.preview_matches(url):
             self.preview.load_preview(url)
 
         running_path = self.runner.running_project_path
         if running_path is not None:
             try:
-                settings = SettingsStore(running_path)
+                settings = self._settings_for_project(running_path)
                 self.preview.set_draft_settings(settings.load_draft())
             except OSError:
                 pass
@@ -479,12 +767,23 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_running_preview(self) -> None:
+        if not self._commit_visual_fields():
+            self._show_inline_commit_error()
+            return
         if self._preview_tab_index() < 0:
             self.open_running_preview()
             return
-        if self.runner.preview_url:
+        if self.runner.preview_url and not self.runner.is_stopping:
             self.preview.refresh_preview()
             self.document_tabs.setCurrentWidget(self.preview)
+
+    def restart_running_project(self) -> None:
+        """An explicit restart opens the new run's preview when it starts."""
+
+        if not self.runner.is_preview_running or self.runner.is_stopping:
+            return
+        self._preview_user_closed = False
+        self.runner.restart_project()
 
     def _project_panel(self) -> QWidget:
         self.projects_box = QGroupBox("Project Library")
@@ -623,7 +922,7 @@ class MainWindow(QMainWindow):
             "project_library": "Project Library",
             "project_explorer": "Project Explorer",
             "output": "Output / Console",
-            "inspector": "Inspector",
+            "inspector": "Properties",
         }
         label = labels.get(panel_name, panel_name.replace("_", " ").title())
         state = "shown" if visible else "collapsed"
@@ -768,6 +1067,22 @@ class MainWindow(QMainWindow):
         self.close_tab_action.setShortcut(QKeySequence.StandardKey.Close)
         self.close_tab_action.triggered.connect(self._close_current_tab)
 
+        self.test_script_action = QAction(
+            standard_icon(QStyle.StandardPixmap.SP_MediaPlay), "Test Current Script", self,
+        )
+        self.test_script_action.setShortcut(QKeySequence("F7"))
+        self.test_script_action.setToolTip("Save changes and run the Python script in the selected editor tab")
+        self.test_script_action.triggered.connect(lambda _checked=False: self.test_current_script())
+        self.stop_script_test_action = QAction(
+            standard_icon(QStyle.StandardPixmap.SP_MediaStop), "Stop Script Test", self,
+        )
+        self.stop_script_test_action.setShortcut(QKeySequence("Shift+F7"))
+        self.stop_script_test_action.setToolTip("Stop the script test, including when its editor tab is closed")
+        self.stop_script_test_action.triggered.connect(self.stop_script_test)
+        # These shortcuts also work while the Project menu is closed.
+        self.addAction(self.test_script_action)
+        self.addAction(self.stop_script_test_action)
+
         project_menu = QMenu("Project", self)
         project_menu.addSection("Create or open")
         project_menu.addAction(self.new_project_action)
@@ -784,6 +1099,8 @@ class MainWindow(QMainWindow):
         project_menu.addAction(self.delete_file_action)
         project_menu.addSeparator()
         project_menu.addSection("Editor")
+        project_menu.addAction(self.test_script_action)
+        project_menu.addAction(self.stop_script_test_action)
         project_menu.addAction(self.save_file_action)
         project_menu.addAction(self.save_all_action)
         project_menu.addAction(self.close_tab_action)
@@ -837,7 +1154,7 @@ class MainWindow(QMainWindow):
         self.restart_action.setShortcut(QKeySequence("Ctrl+F5"))
         self.restart_action.setToolTip("Stop and start the project again")
         self.restart_action.triggered.connect(
-            lambda _checked=False: self.runner.restart_project()
+            lambda _checked=False: self.restart_running_project()
         )
 
         self.refresh_action = QAction(
@@ -952,13 +1269,27 @@ class MainWindow(QMainWindow):
         )
         self.publish_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self.publish_action.setToolTip(
-            "Publish the current visual draft to the selected project"
+            "Publish visual settings to the selected project; open the menu for GitHub and hosting"
         )
         self.publish_action.triggered.connect(self.publish)
         toolbar.addAction(self.publish_action)
         publish_button = toolbar.widgetForAction(self.publish_action)
         if isinstance(publish_button, QToolButton):
             publish_button.setObjectName("PublishToolbarButton")
+            publish_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        publish_menu = QMenu("Publish", self)
+        local_publish = publish_menu.addAction("Publish UI Settings")
+        local_publish.triggered.connect(self.publish)
+        publish_menu.addSeparator()
+        self.publish_github_action = publish_menu.addAction("Publish to GitHub…")
+        self.publish_vercel_action = publish_menu.addAction("Publish to Vercel…")
+        self.publish_streamlit_action = publish_menu.addAction("Publish to Streamlit Community Cloud…")
+        self.publish_github_action.triggered.connect(lambda: self.open_publish_dialog("github"))
+        self.publish_vercel_action.triggered.connect(lambda: self.open_publish_dialog("vercel"))
+        self.publish_streamlit_action.triggered.connect(lambda: self.open_publish_dialog("streamlit"))
+        self.publish_menu = publish_menu
+        if isinstance(publish_button, QToolButton):
+            publish_button.setMenu(publish_menu)
 
         toolbar.addSeparator()
 
@@ -972,7 +1303,7 @@ class MainWindow(QMainWindow):
             ("project_library", "Project Library"),
             ("project_explorer", "Project Explorer"),
             ("output", "Output / Console"),
-            ("inspector", "Inspector"),
+            ("inspector", "Properties"),
         ):
             action = QAction(label, self)
             action.setCheckable(True)
@@ -1024,15 +1355,37 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(view_button)
         self.view_button = view_button
 
+        # Keep the application update control at the right edge, independent
+        # of whether a project is selected or the preview is running.
+        update_spacer = QWidget(toolbar)
+        update_spacer.setObjectName("UpdateToolbarSpacer")
+        update_spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred,
+        )
+        toolbar.addWidget(update_spacer)
+        self.update_action = QAction(
+            standard_icon(QStyle.StandardPixmap.SP_BrowserReload), "Update", self,
+        )
+        self.update_action.setToolTip("Check for Studio updates")
+        self.update_action.triggered.connect(self.open_update_dialog)
+        toolbar.addAction(self.update_action)
+        update_button = toolbar.widgetForAction(self.update_action)
+        if isinstance(update_button, QToolButton):
+            update_button.setObjectName("UpdateToolbarButton")
+        self.update_button = update_button
+
         self._update_project_actions()
 
     def _update_project_actions(self) -> None:
         """Keep actions aligned with the selected and running projects."""
 
+        self._update_script_test_actions()
+        self._update_visual_save_state()
         if not hasattr(self, "run_action"):
             return
 
         has_project = self.current_project is not None
+        setup_blocked = self._selected_setup_blocked()
         any_process_running = self.runner.is_running
         selected_is_running = bool(
             self.current_project
@@ -1052,18 +1405,36 @@ class MainWindow(QMainWindow):
             has_project and self.project_explorer.selected_path is not None
         )
         self.refresh_action.setEnabled(
-            self.runner.is_preview_running and preview_open
+            self.runner.is_preview_running
+            and not self.runner.is_stopping
+            and bool(self.runner.preview_url)
+            and preview_open
         )
         self.open_preview_action.setEnabled(
-            self.runner.is_preview_running and bool(self.runner.preview_url)
+            self.runner.is_preview_running
+            and not self.runner.is_stopping
+            and bool(self.runner.preview_url)
         )
         self.edit_action.setEnabled(
-            selected_is_running and preview_open and preview_selected
+            selected_is_running
+            and not self.runner.is_stopping
+            and preview_open
+            and preview_selected
         )
         self.undo_action.setEnabled(has_project or current_editor is not None)
         self.redo_action.setEnabled(has_project or current_editor is not None)
         self.publish_action.setEnabled(has_project)
-        self.save_file_action.setEnabled(current_editor is not None)
+        for action_name in ("publish_github_action", "publish_vercel_action", "publish_streamlit_action"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(has_project)
+        self.save_file_action.setText(
+            "Save UI Changes" if preview_selected else "Save Current File"
+        )
+        self.save_file_action.setEnabled(
+            current_editor is not None
+            or (preview_selected and self.current_settings is not None)
+        )
         self.save_all_action.setEnabled(bool(self.open_editors))
         self.close_tab_action.setEnabled(self.document_tabs.count() > 0)
 
@@ -1073,7 +1444,7 @@ class MainWindow(QMainWindow):
             not any_process_running or self.runner.is_preview_running
         )
         self.run_action.setEnabled(
-            has_project and not selected_is_running and can_switch_or_run
+            has_project and not selected_is_running and can_switch_or_run and not setup_blocked
         )
         self.run_action.setText(
             "Switch and Run"
@@ -1081,14 +1452,15 @@ class MainWindow(QMainWindow):
             else "Run"
         )
         self.run_action.setToolTip(
-            "Stop the current preview and run the selected project"
+            "Preview support is being prepared. You can continue editing files."
+            if setup_blocked else "Stop the current preview and run the selected project"
             if any_process_running and not selected_is_running
             else "Run the selected Streamlit project"
         )
 
         self.stop_action.setEnabled(any_process_running)
-        self.restart_action.setEnabled(selected_is_running)
-        self.install_action.setEnabled(has_project and not any_process_running)
+        self.restart_action.setEnabled(selected_is_running and not self.runner.is_stopping and not setup_blocked)
+        self.install_action.setEnabled(has_project and not any_process_running and not setup_blocked)
 
         desired_default = (
             self.stop_action
@@ -1139,10 +1511,10 @@ class MainWindow(QMainWindow):
         if selected_item is not None:
             self.project_list.setCurrentItem(selected_item)
         elif self.project_list.count() == 0:
+            self._clear_visual_selection()
             self.current_project = None
             self.current_settings = None
             self.project_explorer.clear_project()
-            self.inspector.clear_selection()
             self._update_project_actions()
 
     def open_project_by_id(self, project_id: str) -> None:
@@ -1251,13 +1623,15 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if not self._clear_visual_selection():
+            self._show_inline_commit_error()
+            return
         if self.runner.is_project_running(self.current_project.path):
             self.runner.stop_project(reason="user")
         self.library.remove(self.current_project.id)
         self.current_project = None
         self.current_settings = None
         self.project_explorer.clear_project()
-        self.inspector.clear_selection()
         self._reload_library()
         self.show_welcome()
 
@@ -1278,12 +1652,19 @@ class MainWindow(QMainWindow):
         # seconds and producing a false "Process crashed" dialog on Windows.
         # Selection now only changes the workspace. The active preview remains
         # alive until the user explicitly presses Run/Switch or Stop.
+        if not self._clear_visual_selection():
+            self._show_inline_commit_error()
+            project_list = getattr(self, "project_list", None)
+            if project_list is not None:
+                with QSignalBlocker(project_list):
+                    project_list.setCurrentItem(_previous)
+            return
         self.current_project = project
-        self.current_settings = SettingsStore(project.path)
+        self.current_settings = self._settings_for_project(project.path)
+        self._visual_project_names[project.path.resolve()] = project.name
         self.library.touch(project.id)
         self.project_explorer.set_project(project.path)
         self.console.set_working_directory(project.path)
-        self.inspector.clear_selection()
         self.show_workspace()
 
         if (
@@ -1300,7 +1681,10 @@ class MainWindow(QMainWindow):
                     preview_index,
                     f"Preview — {project.name}",
                 )
-                if self.preview.current_preview_url != self.runner.preview_url:
+                if (
+                    not self.runner.is_stopping
+                    and not self.preview.preview_matches(self.runner.preview_url)
+                ):
                     self.preview.load_preview(self.runner.preview_url)
                 self.preview.set_draft_settings(
                     self.current_settings.load_draft()
@@ -1337,6 +1721,9 @@ class MainWindow(QMainWindow):
                 "Create, open, or select a project first.",
             )
             return
+        if self._selected_setup_blocked():
+            self.statusBar().showMessage("Preview support is being prepared. You can continue editing files.")
+            return
         manifest = load_manifest(self.current_project.path)
         if manifest is None:
             QMessageBox.warning(
@@ -1365,6 +1752,9 @@ class MainWindow(QMainWindow):
                 "Create, open, or select a project first.",
             )
             return
+        if self._selected_setup_blocked():
+            self.statusBar().showMessage("Setup is already preparing this Python environment. You can continue editing files.")
+            return
         manifest = load_manifest(self.current_project.path)
         if manifest is None:
             QMessageBox.warning(
@@ -1380,41 +1770,64 @@ class MainWindow(QMainWindow):
         )
 
     def _preview_ready(self, project_path: str, url: str) -> None:
-        # A preview may become ready after the user selected another project or
-        # closed the Preview tab. Never force the tab back open: closing the
-        # tab only hides the browser while the Streamlit process stays alive.
-        selected_matches = (
-            self.current_project is not None
-            and Path(project_path).resolve() == self.current_project.path.resolve()
-        )
-        preview_index = self._preview_tab_index()
+        # Readiness belongs to the running process, even when another project's
+        # files are selected. Ignore stale signals from a stopped/replaced run.
+        running_path = self.runner.running_project_path
+        if (
+            running_path is None
+            or self.runner.is_stopping
+            or Path(project_path).resolve() != running_path.resolve()
+            or not self.runner.preview_url
+            or str(url).rstrip("/") != self.runner.preview_url.rstrip("/")
+        ):
+            return
 
-        if selected_matches and preview_index >= 0:
+        preview_index = self._preview_tab_index()
+        project_name = self.runner.running_project_name or running_path.name
+        if preview_index >= 0 and not self._preview_user_closed:
             self.document_tabs.setTabText(
                 preview_index,
-                f"Preview — {self.current_project.name}",
+                f"Preview — {project_name}",
             )
-            self.preview.load_preview(url)
-            if self.current_settings:
+            if not self.preview.preview_matches(url):
+                self.preview.load_preview(url)
+            try:
                 self.preview.set_draft_settings(
-                    self.current_settings.load_draft()
+                    self._settings_for_project(running_path).load_draft()
                 )
-            self.document_tabs.setCurrentIndex(preview_index)
-            self.statusBar().showMessage(f"Preview: {url}")
-        elif selected_matches:
+            except OSError:
+                pass
+            self.statusBar().showMessage(f"Loading preview: {url}")
+        else:
             self._append_log(
-                f"Preview is ready but its tab is closed: {url}\n"
+                f"Streamlit server is ready; its Preview tab is closed: {url}\n"
             )
             self.statusBar().showMessage(
                 "Project is running. Use Run → Open Running Preview."
             )
-        else:
-            self._append_log(
-                f"Preview is ready in the background: {url}\n"
-            )
         self._update_project_actions()
 
+    def _preview_loaded(self, url: str) -> None:
+        if (
+            self._preview_tab_index() < 0
+            or not self.runner.is_preview_running
+            or self.runner.is_stopping
+            or not self.runner.preview_url
+            or str(url).rstrip("/") != self.runner.preview_url.rstrip("/")
+            or not self.preview.preview_matches(url)
+        ):
+            return
+        self._append_log(f"Preview loaded: {url}\n")
+        self.statusBar().showMessage(f"Preview loaded: {url}")
+
     def _runner_state_changed(self, state: str) -> None:
+        if state in {"stopping", "restarting", "switching"}:
+            self._clear_visual_selection(force=True)
+            self.preview.stop_preview()
+        elif state == "stopped" and not self.runner.is_preview_running:
+            # FailedToStart has no finished/process_stopped signal, so the
+            # terminal state also closes any tab opened before process.start().
+            self._close_preview_tab()
         self._update_project_actions()
         self.statusBar().showMessage(f"Project state: {state}")
 
@@ -1424,11 +1837,25 @@ class MainWindow(QMainWindow):
         project_name: str,
         project_path: str,
     ) -> None:
+        if (
+            self.runner.is_stopping
+            or not self.runner.is_project_running(project_path)
+        ):
+            return
         self.console.append_system_message(
             f"Streamlit started: {project_name} (PID {pid})"
         )
         self.console.set_working_directory(Path(project_path))
         self.console.show_process(pid)
+        if not self._preview_user_closed:
+            # A queued restart/switch begins after the old process has closed
+            # its tab. Manual closure while waiting still takes precedence.
+            existing_index = self._preview_tab_index()
+            self._ensure_preview_tab(
+                select=existing_index < 0,
+                title=f"Preview — {project_name}",
+            )
+            self.preview.show_project_placeholder(project_name, starting=True)
 
     def _runner_process_stopped(
         self,
@@ -1440,26 +1867,12 @@ class MainWindow(QMainWindow):
         self.console.append_system_message(
             f"Streamlit {reason}: {project_name} (exit code {exit_code})"
         )
-        self._update_project_actions()
-
-        if self.edit_action.isChecked():
-            self.edit_action.setChecked(False)
-
-        if (
-            self.current_project is not None
-            and not self.runner.is_project_running(self.current_project.path)
-            and self.runner.running_project_path is None
-            and not self.runner.has_pending_start
-            and self._preview_tab_index() >= 0
-        ):
-            index = self._preview_tab_index()
-            self.document_tabs.setTabText(
-                index,
-                f"Preview — {self.current_project.name}",
-            )
-            self.preview.show_project_placeholder(self.current_project.name)
+        if not self.runner.is_preview_running:
+            self._close_preview_tab()
 
     def _show_runner_error(self, message: str) -> None:
+        if not self.runner.is_preview_running and not self.runner.has_pending_start:
+            self._close_preview_tab()
         self._append_log(f"\nERROR: {message}\n")
         QMessageBox.critical(self, "Project failed", message)
 
@@ -1480,33 +1893,312 @@ class MainWindow(QMainWindow):
         )
         menu.exec(self.logs.viewport().mapToGlobal(position))
 
+    def _settings_for_project(self, project_path: Path) -> SettingsStore:
+        """Keep each project's working draft alive across workspace changes."""
+
+        path = Path(project_path).expanduser().resolve()
+        if not hasattr(self, "_visual_settings"):
+            self._visual_settings = {}
+            self._visual_project_names = {}
+        if path not in self._visual_settings:
+            current = getattr(self, "current_settings", None)
+            if current is not None and current.project_path.resolve() == path:
+                self._visual_settings[path] = current
+            else:
+                self._visual_settings[path] = SettingsStore(path)
+        self._visual_project_names.setdefault(path, path.name)
+        return self._visual_settings[path]
+
+    def _commit_property_fields(self) -> None:
+        inspector = getattr(self, "inspector", None)
+        commit = getattr(inspector, "commit_pending_edits", None)
+        if callable(commit):
+            commit()
+
+    def _commit_visual_fields(self) -> bool:
+        """Flush browser text before saving or changing its project owner."""
+
+        if getattr(self, "_visual_commit_in_progress", False):
+            return False
+        self._visual_commit_in_progress = True
+        try:
+            preview = getattr(self, "preview", None)
+            commit = getattr(preview, "commit_inline_edit", None)
+            if callable(commit) and not commit():
+                return False
+            self._commit_property_fields()
+            return True
+        finally:
+            self._visual_commit_in_progress = False
+
+    def _show_inline_commit_error(self) -> None:
+        QMessageBox.warning(
+            self,
+            "Text edit is still open",
+            "Studio could not finish reading the text edit from the Preview. "
+            "Your changes are still open. Finish typing in the Preview, then try again.",
+        )
+
+    def _clear_visual_selection(self, *, force: bool = False) -> bool:
+        if not self._commit_visual_fields() and not force:
+            return False
+        owner = getattr(self, "_inline_visual_owner", None)
+        if owner is not None:
+            # An exited/crashed server must still close its tab. Preserve every
+            # acknowledged character as one working-draft edit in that case.
+            self._settings_for_project(owner[0]).finish_text_edit()
+        self._inline_visual_owner = None
+        self._inline_pending = False
+        inspector = getattr(self, "inspector", None)
+        if inspector is not None:
+            inspector.clear_selection()
+        self._visual_selection_project = None
+        self._update_visual_save_state()
+        return True
+
+    def _update_visual_save_state(self) -> None:
+        inspector = getattr(self, "inspector", None)
+        update = getattr(inspector, "set_save_state", None)
+        if not callable(update):
+            return
+        settings = getattr(self, "current_settings", None)
+        project = getattr(self, "current_project", None)
+        owner = getattr(self, "_inline_visual_owner", None)
+        pending_inline = bool(
+            getattr(self, "_inline_pending", False)
+            and owner is not None
+            and project is not None
+            and owner[0] == project.path.resolve()
+        )
+        update(
+            bool(settings is not None and (settings.is_dirty or pending_inline)),
+            project_name=getattr(project, "name", ""),
+            enabled=settings is not None,
+        )
+
+    def save_visual_changes(self, *, project_path: Path | None = None) -> bool:
+        """Commit the active field before saving its project's working draft."""
+
+        if not self._commit_visual_fields():
+            self._show_inline_commit_error()
+            return False
+        if project_path is None:
+            if self.current_project is None or self.current_settings is None:
+                return False
+            project_path = self.current_project.path
+        settings = self._settings_for_project(project_path)
+        try:
+            settings.save_draft()
+        except (OSError, ValueError) as exc:
+            self._update_visual_save_state()
+            QMessageBox.critical(
+                self,
+                "Could not save UI changes",
+                "Your UI changes are still open and have not been discarded.\n\n"
+                f"{exc}",
+            )
+            return False
+        self._update_visual_save_state()
+        path = Path(project_path).resolve()
+        name = self._visual_project_names.get(path, path.name)
+        self.statusBar().showMessage(f"UI changes saved: {name}")
+        return True
+
+    def _confirm_visual_exit(self) -> bool:
+        if not self._commit_visual_fields():
+            self._show_inline_commit_error()
+            return False
+        current = getattr(self, "current_settings", None)
+        if current is not None:
+            self._settings_for_project(current.project_path)
+        stores = getattr(self, "_visual_settings", {})
+        names = getattr(self, "_visual_project_names", {})
+        dirty_paths = sorted(
+            (path for path, settings in stores.items() if settings.is_dirty),
+            key=lambda path: (names.get(path, path.name).casefold(), str(path)),
+        )
+        if not dirty_paths:
+            return True
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Unsaved UI changes")
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText("Save your UI changes before leaving?")
+        project_names = "\n".join(names.get(path, path.name) for path in dirty_paths)
+        dialog.setInformativeText(
+            f"Unsaved changes in:\n{project_names}\n\n"
+            "Save keeps these changes. Discard leaves the last saved version. "
+            "Cancel keeps Studio open."
+        )
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.Save)
+        dialog.setEscapeButton(QMessageBox.StandardButton.Cancel)
+        if len(dirty_paths) > 1:
+            dialog.button(QMessageBox.StandardButton.Save).setText("Save All")
+        answer = dialog.exec()
+        if answer == QMessageBox.StandardButton.Save:
+            return all(
+                self.save_visual_changes(project_path=path) for path in dirty_paths
+            )
+        return answer == QMessageBox.StandardButton.Discard
+
     def _toggle_edit_mode(self, enabled: bool) -> None:
+        if not self._clear_visual_selection():
+            with QSignalBlocker(self.edit_action):
+                self.edit_action.setChecked(not enabled)
+            self._show_inline_commit_error()
+            return
         self.preview.set_edit_mode(enabled)
-        self.inspector.clear_selection()
         if enabled:
             self.statusBar().showMessage(
-                "Edit Mode is on — point at any visible element and click it"
+                "Edit Mode is on — click text to type, or select an element to change its Properties"
             )
         else:
             self.statusBar().showMessage("Edit Mode is off")
 
     def _element_selected(self, data: dict) -> None:
+        running_path = self.runner.running_project_path
+        if (
+            getattr(self, "_closing_approved", False)
+            or self.current_project is None
+            or running_path is None
+            or self.runner.is_stopping
+            or self.current_project.path.resolve() != running_path.resolve()
+            or not self.edit_action.isChecked()
+            or self.document_tabs.currentWidget() is not self.preview
+        ):
+            return
+        # JavaScript has already opened the new inline editor by the time this
+        # queued selection reaches Qt. Only flush the previous Properties fields.
+        self._commit_property_fields()
+        self._visual_selection_project = running_path.resolve()
         self.inspector.set_selection(data)
         self.statusBar().showMessage(
             f"Selected element: {data.get('label') or data.get('id', '')}"
         )
 
-    def _property_changed(self, element_id: str, patch: dict) -> None:
-        if not self.current_settings:
+    def _inline_edit_started(self, element_id: str) -> None:
+        running_path = self.runner.running_project_path
+        inspector = getattr(self, "inspector", None)
+        if (
+            getattr(self, "_closing_approved", False)
+            or not isinstance(element_id, str)
+            or not element_id
+            or self.current_project is None
+            or running_path is None
+            or self.runner.is_stopping
+            or self.current_project.path.resolve() != running_path.resolve()
+            or getattr(self, "_visual_selection_project", None) != running_path.resolve()
+            or not self.edit_action.isChecked()
+            or self.document_tabs.currentWidget() is not self.preview
+            or inspector is None
+            or inspector.element_id != element_id
+            or "text" not in getattr(inspector, "_allowed_fields", set())
+        ):
             return
-        self.current_settings.set_element_patch(element_id, patch)
-        self.preview.apply_patch(element_id, patch)
-        self.statusBar().showMessage(f"Draft updated: {element_id}")
+        owner = (running_path.resolve(), element_id)
+        previous = getattr(self, "_inline_visual_owner", None)
+        if previous is not None and previous != owner:
+            self._settings_for_project(previous[0]).finish_text_edit()
+        self._inline_visual_owner = owner
+        original = getattr(self.preview, "inline_original_text", None)
+        self._settings_for_project(owner[0]).begin_text_edit(
+            element_id, original_text=original if isinstance(original, str) else None
+        )
+        self._update_visual_save_state()
+
+    def _inline_text_changed(self, element_id: str, patch: dict) -> None:
+        owner = getattr(self, "_inline_visual_owner", None)
+        if (
+            getattr(self, "_closing_approved", False)
+            or owner is None
+            or owner[1] != element_id
+            or not isinstance(patch, dict)
+            or set(patch) != {"text"}
+            or not isinstance(patch["text"], str)
+        ):
+            return
+        self._settings_for_project(owner[0]).set_element_patch(element_id, patch)
+        update = getattr(self.inspector, "update_inline_text", None)
+        if callable(update):
+            update(element_id, patch["text"])
+        # The browser already applied this exact input. Echoing a queued DOM
+        # patch back on each key could overwrite a more recent character.
+        self._update_visual_save_state()
+        self.statusBar().showMessage("UI changes are unsaved. Use Save in Properties.")
+
+    def _inline_edit_finished(self, element_id: str, cancelled: bool) -> None:
+        owner = getattr(self, "_inline_visual_owner", None)
+        if owner is None or owner[1] != element_id:
+            return
+        settings = self._settings_for_project(owner[0])
+        settings.finish_text_edit(cancel=cancelled)
+        self._inline_visual_owner = None
+        self._inline_pending = False
+        final_draft = settings.load_draft()
+        final_element = final_draft.get(element_id, {})
+        if isinstance(final_element, dict) and isinstance(final_element.get("text"), str):
+            update = getattr(self.inspector, "update_inline_text", None)
+            if callable(update):
+                # Selection can have been queued before the prior Properties
+                # field committed. Mirror the finalized draft, not that old DOM.
+                update(element_id, final_element["text"])
+        if self.runner.is_project_running(owner[0]) and not self.runner.is_stopping:
+            # Escape and typing back to the original can remove a newly added
+            # text override entirely. Keep future frame reloads consistent too.
+            self.preview.set_draft_settings(final_draft)
+        self._update_visual_save_state()
+
+    def _inline_pending_changed(self, pending: bool) -> None:
+        self._inline_pending = bool(pending)
+        self._update_visual_save_state()
+
+    def _property_changed(self, element_id: str, patch: dict) -> None:
+        owner = getattr(self, "_visual_selection_project", None)
+        if (
+            getattr(self, "_closing_approved", False)
+            or owner is None
+            or not element_id
+            or element_id != self.inspector.element_id
+        ):
+            return
+        settings = self._settings_for_project(owner)
+        before = settings.load_draft()
+        after = settings.set_element_patch(element_id, patch)
+        if before == after:
+            return
+        if self.runner.is_project_running(owner) and not self.runner.is_stopping:
+            self.preview.apply_patch(element_id, patch)
+        self._update_visual_save_state()
+        self.statusBar().showMessage(
+            "UI changes are unsaved. Use Save in Properties."
+        )
 
     def publish(self) -> None:
+        if not self._commit_visual_fields():
+            self._show_inline_commit_error()
+            return
         if not self.current_settings:
             return
-        self.current_settings.publish()
+        try:
+            self.current_settings.publish()
+        except (OSError, ValueError) as exc:
+            self._update_visual_save_state()
+            state = (
+                "Your UI changes remain unsaved in Properties."
+                if self.current_settings.is_dirty
+                else "Your UI changes are saved, but publishing did not complete."
+            )
+            QMessageBox.critical(
+                self, "Could not publish UI changes", f"{state}\n\n{exc}"
+            )
+            return
+        self._update_visual_save_state()
         QMessageBox.information(
             self,
             "Published",
@@ -1515,6 +2207,37 @@ class MainWindow(QMainWindow):
             "website to use them, the managed project must load published.json "
             "or include the Studio runtime helper.",
         )
+
+    def open_publish_dialog(self, target: str = "github") -> None:
+        """Save the selected project's files before local publication review."""
+
+        if self.current_project is None or self.current_settings is None:
+            return
+        if not self._commit_visual_fields():
+            self._show_inline_commit_error()
+            return
+        project = self.current_project
+        project_path = project.path.resolve()
+        for editor in list(self.open_editors.values()):
+            if editor.project_path.resolve() == project_path and editor.is_modified:
+                if not editor.save():
+                    return
+        try:
+            self.current_settings.publish()
+        except (OSError, ValueError) as exc:
+            self._update_visual_save_state()
+            QMessageBox.critical(
+                self,
+                "Could not prepare project for publishing",
+                "Studio could not save the selected project's UI settings. "
+                f"Your changes are still available.\n\n{exc}",
+            )
+            return
+        self._update_visual_save_state()
+        from .publish_dialog import PublishDialog
+
+        dialog = PublishDialog(project.path, project.name, initial_target=target, parent=self)
+        dialog.exec()
 
     def undo(self) -> None:
         focused = QApplication.focusWidget()
@@ -1527,11 +2250,19 @@ class MainWindow(QMainWindow):
             return
         if self.document_tabs.currentWidget() is not self.preview:
             return
-        if not self.current_settings:
+        if (
+            not self.current_settings
+            or self.current_project is None
+            or not self.runner.is_project_running(self.current_project.path)
+        ):
+            return
+        if not self._commit_visual_fields():
+            self._show_inline_commit_error()
             return
         state = self.current_settings.undo()
         if state is not None:
             self.preview.set_draft_settings(state)
+            self._clear_visual_selection()
             self.statusBar().showMessage("Undo")
 
     def redo(self) -> None:
@@ -1545,11 +2276,19 @@ class MainWindow(QMainWindow):
             return
         if self.document_tabs.currentWidget() is not self.preview:
             return
-        if not self.current_settings:
+        if (
+            not self.current_settings
+            or self.current_project is None
+            or not self.runner.is_project_running(self.current_project.path)
+        ):
+            return
+        if not self._commit_visual_fields():
+            self._show_inline_commit_error()
             return
         state = self.current_settings.redo()
         if state is not None:
             self.preview.set_draft_settings(state)
+            self._clear_visual_selection()
             self.statusBar().showMessage("Redo")
 
     def open_current_folder(self) -> None:
@@ -1559,13 +2298,62 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        if not self._can_close_all_editors():
+        if not getattr(self, "_closing_approved", False):
+            if not self._commit_visual_fields():
+                self._show_inline_commit_error()
+                event.ignore()
+                return
+            if not self._can_close_all_editors():
+                event.ignore()
+                return
+            if not self._confirm_visual_exit():
+                event.ignore()
+                return
+            self._closing_approved = True
+            self._save_workspace_layout()
+        updates = getattr(self, "update_controller", None)
+        if updates is not None:
+            updates.begin_shutdown()
+        if updates is not None and updates.is_active:
+            self._waiting_for_update_shutdown = True
+            self._set_closing_controls_enabled(False)
             event.ignore()
             return
-        self._save_workspace_layout()
+        controller = getattr(self, "background_setup", None)
+        if controller is not None and controller.is_active:
+            self._waiting_for_setup_shutdown = True
+            # The existing save/discard prompts have completed. Prevent new
+            # edits while cancellation releases the installer and its lock.
+            self._set_closing_controls_enabled(False)
+            controller.cancel()
+            event.ignore()
+            return
+        if getattr(self, "_update_restart_requested", None) is not None:
+            try:
+                # The trusted helper stages its process outside the app and
+                # waits for this process to exit before replacing any file.
+                updates.launch_pending_update()
+            except Exception as error:
+                self._closing_approved = False
+                self._update_restart_requested = None
+                self._waiting_for_setup_shutdown = False
+                self._set_closing_controls_enabled(True)
+                updates.update_launch_failed("Studio could not start the update. Download it again to prepare a fresh restart.")
+                from .update_install import UpdateInstallError
+                detail = str(error) if isinstance(error, UpdateInstallError) else (
+                    "Studio could not start its update helper. Your installed files have not changed."
+                )
+                QMessageBox.warning(self, "Update could not start", detail)
+                event.ignore()
+                return
+            self._update_restart_requested = None
         for editor in list(self.open_editors.values()):
             editor.shutdown()
         shutdown_python_assist()
+        script_runner = getattr(self, "script_runner", None)
+        if script_runner is not None:
+            script_runner.shutdown()
+        self.preview.stop_preview()
         self.runner.shutdown()
         self.console.shutdown()
         super().closeEvent(event)
